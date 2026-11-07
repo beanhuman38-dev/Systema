@@ -1,0 +1,640 @@
+/**
+ * Systema — stable Item_ID automation
+ *
+ * Confirmed workbook structure:
+ *   Sheet: Items
+ *   Header row: Item_ID, Title, Type, Status, Sector, Minutes, Deadline
+ *
+ * IDs are generated only for rows with real item data and a blank Item_ID.
+ * Existing IDs are never renumbered or replaced.
+ */
+
+const SYSTEMA_IDS = Object.freeze({
+  ITEMS_SHEET: 'Items',
+  HEADER_ROW: 1,
+  ID_COLUMN: 1,
+  FIRST_DATA_COLUMN: 2,
+  LAST_DATA_COLUMN: 7,
+  ID_PREFIX: 'ITM-',
+  EXPECTED_HEADERS: [
+    'Item_ID', 'Title', 'Type', 'Status', 'Sector', 'Minutes', 'Deadline',
+  ],
+});
+
+/** Adds the Systema menu whenever the spreadsheet opens. */
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Systema')
+    .addItem('Set up / backfill missing IDs', 'installItemIdAutomation')
+    .addItem('Check Item_ID integrity', 'auditItemIds')
+    .addItem('Validate Items', 'validateItemsData')
+    .addItem('Create Backup', 'createSystemaBackup')
+    .addToUi();
+}
+
+/**
+ * Run once after pasting this file. It validates the agreed Items layout,
+ * then gives IDs to any existing populated rows that do not have one.
+ */
+function installItemIdAutomation() {
+  const sheet = getItemsSheet_();
+  const assigned = assignMissingItemIds_(sheet, SYSTEMA_IDS.HEADER_ROW + 1, getLastDataRow_(sheet));
+  SpreadsheetApp.getActive().toast(
+    assigned ? `Assigned ${assigned} missing Item_ID${assigned === 1 ? '' : 's'}.` : 'No missing Item_IDs found.',
+    'Systema setup',
+    6
+  );
+}
+
+/**
+ * Runs automatically when a person edits the Items sheet.
+ * It supports typing or pasting one or many new rows. Script/API/formula writes
+ * do not fire onEdit, so use the Systema menu after imports.
+ */
+function onEdit(event) {
+  if (!event || !event.range) return;
+
+  const range = event.range;
+  const sheet = range.getSheet();
+
+  if (sheet.getName() !== SYSTEMA_IDS.ITEMS_SHEET) return;
+  if (range.getLastRow() <= SYSTEMA_IDS.HEADER_ROW) return;
+
+  // Only process edits that intersect with the item data columns B:G.
+  const firstColumn = Math.max(
+    range.getColumn(),
+    SYSTEMA_IDS.FIRST_DATA_COLUMN
+  );
+
+  const lastColumn = Math.min(
+    range.getLastColumn(),
+    SYSTEMA_IDS.LAST_DATA_COLUMN
+  );
+
+  if (firstColumn > lastColumn) return;
+
+  const startRow = Math.max(
+    range.getRow(),
+    SYSTEMA_IDS.HEADER_ROW + 1
+  );
+
+  const endRow = range.getLastRow();
+  const numberOfRows = endRow - startRow + 1;
+
+  try {
+    validateItemsHeaders_(sheet);
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const changes = ss.getSheetByName('Changes');
+
+    if (!changes) {
+      throw new Error('Changes sheet not found.');
+    }
+
+    // Check the Changes sheet structure before writing.
+    const expectedHeaders = [
+      'Date', 'Time', 'Item', 'Action', 'Changed By', 'Description'
+    ];
+
+    const actualHeaders = changes
+      .getRange(1, 1, 1, expectedHeaders.length)
+      .getDisplayValues()[0]
+      .map(value => String(value).trim());
+
+    if (actualHeaders.join('\u0001') !== expectedHeaders.join('\u0001')) {
+      throw new Error('Changes sheet headers do not match the expected structure.');
+    }
+
+    // Remember which rows already had IDs before this edit.
+    const previousIds = sheet
+      .getRange(startRow, SYSTEMA_IDS.ID_COLUMN, numberOfRows, 1)
+      .getDisplayValues()
+      .flat();
+
+    // Preserve your existing automatic ID assignment.
+    const assigned = assignMissingItemIds_(
+      sheet,
+      startRow,
+      endRow
+    );
+
+    // Read the IDs after assignment.
+    const currentIds = sheet
+      .getRange(startRow, SYSTEMA_IDS.ID_COLUMN, numberOfRows, 1)
+      .getDisplayValues()
+      .flat();
+
+    const itemData = sheet
+      .getRange(
+        startRow,
+        SYSTEMA_IDS.FIRST_DATA_COLUMN,
+        numberOfRows,
+        SYSTEMA_IDS.LAST_DATA_COLUMN - SYSTEMA_IDS.FIRST_DATA_COLUMN + 1
+      )
+      .getValues();
+
+    // Identify which fields were included in the edit.
+    const changedFields = [];
+
+    for (let column = firstColumn; column <= lastColumn; column++) {
+      changedFields.push(
+        SYSTEMA_IDS.EXPECTED_HEADERS[column - 1]
+      );
+    }
+
+    const singleCellEdit =
+      range.getNumRows() === 1 &&
+      range.getNumColumns() === 1;
+
+    let description;
+
+    if (singleCellEdit) {
+      const oldValue = event.oldValue === undefined
+        ? '(previous value unavailable)'
+        : String(event.oldValue);
+
+      const newValue = event.value === undefined
+        ? '(blank)'
+        : String(event.value);
+
+      description = `${changedFields[0]}: "${oldValue}" → "${newValue}"`;
+    } else {
+      description = `Edited fields: ${changedFields.join(', ')}`;
+    }
+
+    const now = new Date();
+    const timezone = ss.getSpreadsheetTimeZone();
+
+    const date = Utilities.formatDate(
+      now,
+      timezone,
+      'dd/MM/yyyy'
+    );
+
+    const time = Utilities.formatDate(
+      now,
+      timezone,
+      'HH:mm:ss'
+    );
+
+    // Create one audit entry for each affected item row.
+    for (let i = 0; i < numberOfRows; i++) {
+      const itemId = currentIds[i];
+      const hasData = itemData[i].some(value =>
+        value !== '' && value !== null && value !== undefined
+      );
+
+      if (!itemId && !hasData) continue;
+
+      const action = previousIds[i]
+        ? 'Updated'
+        : 'Created';
+
+      changes.appendRow([
+        date,
+        time,
+        itemId || '(ID unavailable)',
+        action,
+        'User edit',
+        description
+      ]);
+    }
+
+    if (assigned) {
+      ss.toast(
+        `Assigned ${assigned} new Item_ID${assigned === 1 ? '' : 's'}.`,
+        'Systema',
+        4
+      );
+    }
+
+  } catch (error) {
+    // Try to record the original error in the Errors sheet.
+    let loggingFailure = '';
+
+    try {
+      logSystemError_('Item edit processing', error);
+    } catch (loggingError) {
+      loggingFailure = ` Error logging also failed: ${loggingError.message}`;
+    }
+
+    SpreadsheetApp.getActiveSpreadsheet().toast(
+      `${error.message}${loggingFailure}`,
+      'Systema edit processing',
+      8
+    );
+  }
+}
+
+/** Reports duplicates or missing IDs without changing any data. */
+function auditItemIds() {
+  const sheet = getItemsSheet_();
+  const lastRow = getLastDataRow_(sheet);
+  if (lastRow <= SYSTEMA_IDS.HEADER_ROW) {
+    SpreadsheetApp.getActive().toast('Items has no data rows yet.', 'Systema ID check', 5);
+    return;
+  }
+
+  const rows = sheet
+    .getRange(SYSTEMA_IDS.HEADER_ROW + 1, SYSTEMA_IDS.ID_COLUMN,
+      lastRow - SYSTEMA_IDS.HEADER_ROW, SYSTEMA_IDS.LAST_DATA_COLUMN)
+    .getValues();
+  const seen = new Map();
+  const duplicateRows = [];
+  const missingRows = [];
+
+  rows.forEach((row, index) => {
+    const rowNumber = index + SYSTEMA_IDS.HEADER_ROW + 1;
+    const id = normaliseId_(row[0]);
+    const hasItemData = row.slice(SYSTEMA_IDS.FIRST_DATA_COLUMN - 1).some(hasValue_);
+    if (hasItemData && !id) missingRows.push(rowNumber);
+    if (!id) return;
+    if (seen.has(id)) duplicateRows.push(`${id} (rows ${seen.get(id)} and ${rowNumber})`);
+    else seen.set(id, rowNumber);
+  });
+
+  if (duplicateRows.length || missingRows.length) {
+    const parts = [];
+    if (duplicateRows.length) parts.push(`Duplicate IDs: ${duplicateRows.join('; ')}`);
+    if (missingRows.length) parts.push(`Missing IDs on rows: ${missingRows.join(', ')}`);
+    SpreadsheetApp.getUi().alert('Systema Item_ID check', parts.join('\n\n'), SpreadsheetApp.getUi().ButtonSet.OK);
+    return;
+  }
+
+  SpreadsheetApp.getActive().toast('All populated item rows have unique Item_IDs.', 'Systema ID check', 5);
+}
+
+/** Assigns IDs only to blank-ID rows with data in Title through Deadline. */
+function assignMissingItemIds_(sheet, startRow, endRow) {
+  validateItemsHeaders_(sheet);
+  if (endRow < startRow) return 0;
+
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(20000);
+  try {
+    const lastDataRow = Math.max(endRow, getLastDataRow_(sheet));
+    const allIds = sheet
+      .getRange(SYSTEMA_IDS.HEADER_ROW + 1, SYSTEMA_IDS.ID_COLUMN,
+        Math.max(0, lastDataRow - SYSTEMA_IDS.HEADER_ROW), 1)
+      .getDisplayValues()
+      .flat()
+      .map(normaliseId_)
+      .filter(Boolean);
+
+    assertNoDuplicates_(allIds);
+    const usedIds = new Set(allIds);
+    const values = sheet
+      .getRange(startRow, SYSTEMA_IDS.ID_COLUMN, endRow - startRow + 1,
+        SYSTEMA_IDS.LAST_DATA_COLUMN)
+      .getValues();
+
+    let assigned = 0;
+    values.forEach((row, index) => {
+      const id = normaliseId_(row[0]);
+      const hasItemData = row.slice(SYSTEMA_IDS.FIRST_DATA_COLUMN - 1).some(hasValue_);
+      if (id || !hasItemData) return;
+
+      const newId = createUniqueId_(usedIds);
+      sheet.getRange(startRow + index, SYSTEMA_IDS.ID_COLUMN).setValue(newId);
+      usedIds.add(newId);
+      assigned += 1;
+    });
+    return assigned;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getItemsSheet_() {
+  const sheet = SpreadsheetApp.getActive().getSheetByName(SYSTEMA_IDS.ITEMS_SHEET);
+  if (!sheet) throw new Error('Missing required sheet: Items');
+  validateItemsHeaders_(sheet);
+  return sheet;
+}
+
+function validateItemsHeaders_(sheet) {
+  const actual = sheet
+    .getRange(SYSTEMA_IDS.HEADER_ROW, 1, 1, SYSTEMA_IDS.EXPECTED_HEADERS.length)
+    .getDisplayValues()[0]
+    .map(value => String(value).trim());
+  const expected = SYSTEMA_IDS.EXPECTED_HEADERS;
+  if (actual.join('\u0001') !== expected.join('\u0001')) {
+    throw new Error(`Items headers changed. Expected: ${expected.join(', ')}`);
+  }
+}
+
+function getLastDataRow_(sheet) {
+  return Math.max(sheet.getLastRow(), SYSTEMA_IDS.HEADER_ROW);
+}
+
+function createUniqueId_(usedIds) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const id = SYSTEMA_IDS.ID_PREFIX + Utilities.getUuid()
+      .replace(/-/g, '')
+      .slice(0, 16)
+      .toUpperCase();
+    if (!usedIds.has(id)) return id;
+  }
+  throw new Error('Could not generate a unique Item_ID. Please run the ID integrity check.');
+}
+
+function assertNoDuplicates_(ids) {
+  const seen = new Set();
+  const duplicates = new Set();
+  ids.forEach(id => {
+    if (seen.has(id)) duplicates.add(id);
+    seen.add(id);
+  });
+  if (duplicates.size) {
+    throw new Error(`Duplicate Item_ID found: ${[...duplicates].join(', ')}. Fix it before adding more items.`);
+  }
+}
+
+function normaliseId_(value) {
+  return String(value == null ? '' : value).trim();
+}
+
+function hasValue_(value) {
+  return typeof value === 'string' ? value.trim() !== '' : value !== null && value !== undefined;
+}
+
+function validateItemsData() {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const items = getItemsSheet_();
+  validateItemsHeaders_(items);
+
+  const projects = ss.getSheetByName('Projects');
+
+  if (!projects) {
+    throw new Error('Projects sheet not found.');
+  }
+
+  const lastRow = items.getLastRow();
+
+  if (lastRow <= SYSTEMA_IDS.HEADER_ROW) {
+    ui.alert('No items to validate.');
+    return;
+  }
+
+  // Read Items columns B:G
+  const rows = items.getRange(
+    SYSTEMA_IDS.HEADER_ROW + 1,
+    2,
+    lastRow - SYSTEMA_IDS.HEADER_ROW,
+    6
+  ).getValues();
+
+  // Read valid sectors from Projects column A
+  const projectLastRow = projects.getLastRow();
+
+  const sectors = projectLastRow > 1
+    ? projects.getRange(2, 1, projectLastRow - 1, 1)
+        .getValues()
+        .flat()
+        .filter(value => value !== '')
+        .map(value => String(value).trim().toLowerCase())
+    : [];
+
+  const validSectors = new Set(sectors);
+
+  const validTypes = [
+    'Task',
+    'Habit',
+    'Event',
+    'Project milestone'
+  ];
+
+  const validStatuses = [
+    'Not Started',
+    'In Progress',
+    'Completed',
+    'Paused'
+  ];
+
+  const errors = [];
+
+  rows.forEach((row, index) => {
+    const sheetRow = index + SYSTEMA_IDS.HEADER_ROW + 1;
+
+    const [
+      title,
+      type,
+      status,
+      sector,
+      minutes,
+      deadline
+    ] = row;
+
+    // Ignore completely empty rows
+    if (row.every(value => value === '' || value === null || value === undefined)) {
+      return;
+    }
+
+    if (!String(title).trim()) {
+      errors.push(`Row ${sheetRow}: Title is required.`);
+    }
+
+    if (!validTypes.includes(type)) {
+      errors.push(`Row ${sheetRow}: Invalid Type "${type}".`);
+    }
+
+    if (!validStatuses.includes(status)) {
+      errors.push(`Row ${sheetRow}: Invalid Status "${status}".`);
+    }
+
+    if (
+      !sector ||
+      !validSectors.has(String(sector).trim().toLowerCase())
+    ) {
+      errors.push(`Row ${sheetRow}: Invalid or missing Sector "${sector}".`);
+    }
+
+    if (
+      minutes !== '' &&
+      minutes !== null &&
+      minutes !== undefined &&
+      (
+        typeof minutes !== 'number' ||
+        !Number.isInteger(minutes) ||
+        minutes <= 0
+      )
+    ) {
+      errors.push(`Row ${sheetRow}: Minutes must be a positive whole number.`);
+    }
+
+    if (
+      deadline !== '' &&
+      deadline !== null &&
+      deadline !== undefined &&
+      (
+        !(deadline instanceof Date) ||
+        isNaN(deadline.getTime())
+      )
+    ) {
+      errors.push(`Row ${sheetRow}: Deadline must be a valid date.`);
+    }
+  });
+
+  if (errors.length === 0) {
+    ui.alert('Validation successful', 'All populated items passed validation.', ui.ButtonSet.OK);
+  } else {
+    const visibleErrors = errors.slice(0, 30).join('\n');
+    const remaining = errors.length > 30
+      ? `\n\n...and ${errors.length - 30} more errors.`
+      : '';
+
+    ui.alert(
+      'Validation found problems',
+      `${errors.length} issue(s) found:\n\n${visibleErrors}${remaining}`,
+      ui.ButtonSet.OK
+    );
+  }
+}
+
+/**
+ * Records backend errors in the Errors sheet.
+ * Reusable by all Systema modules.
+ */
+function logSystemError_(systemName, error) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const errorsSheet = ss.getSheetByName('Errors');
+
+  if (!errorsSheet) {
+    throw new Error('Errors sheet not found.');
+  }
+
+  const expectedHeaders = [
+    'Date', 'Time', 'System', 'Problem', 'Status', 'Details'
+  ];
+
+  const actualHeaders = errorsSheet
+    .getRange(1, 1, 1, 6)
+    .getDisplayValues()[0]
+    .map(value => String(value).trim());
+
+  if (actualHeaders.join('\u0001') !== expectedHeaders.join('\u0001')) {
+    throw new Error('Errors sheet headers do not match.');
+  }
+
+  const now = new Date();
+  const timezone = ss.getSpreadsheetTimeZone();
+
+  const dateStr = Utilities.formatDate(now, timezone, 'dd/MM/yyyy');
+  const timeStr = Utilities.formatDate(now, timezone, 'HH:mm:ss');
+
+  const problem = error && error.message
+    ? String(error.message)
+    : String(error);
+
+  const details = error && error.stack
+    ? String(error.stack)
+    : problem;
+
+  const logRow = errorsSheet.getLastRow() + 1;
+
+  errorsSheet.appendRow([
+    dateStr,
+    timeStr,
+    systemName,
+    problem,
+    'New',
+    details
+  ]);
+
+  errorsSheet.getRange(logRow, 1).setNumberFormat('dd/MM/yyyy');
+  errorsSheet.getRange(logRow, 2).setNumberFormat('HH:mm:ss');
+}
+
+function testErrorLogger() {
+  try {
+    throw new Error('Systema error logger test');
+  } catch (error) {
+    logSystemError_('Test module', error);
+  }
+}
+
+/**
+ * Creates a complete backup of the Systema spreadsheet.
+ * Stores it in the same Drive folder as the original.
+ */
+function createSystemaBackup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const lock = LockService.getDocumentLock();
+
+  lock.waitLock(20000);
+
+  try {
+    const backupsSheet = ss.getSheetByName('Backups');
+
+    if (!backupsSheet) {
+      throw new Error('Backups sheet not found.');
+    }
+
+    const expectedHeaders = [
+      'Date', 'Time', 'Backup Name', 'Status'
+    ];
+
+    const actualHeaders = backupsSheet
+      .getRange(1, 1, 1, 4)
+      .getDisplayValues()[0]
+      .map(value => String(value).trim());
+
+    if (actualHeaders.join('\u0001') !== expectedHeaders.join('\u0001')) {
+      throw new Error('Backups sheet headers do not match.');
+    }
+
+    // Generate a unique timestamped backup name.
+    const now = new Date();
+    const timestamp = Utilities.formatDate(now, ss.getSpreadsheetTimeZone(), "yyyy-MM-dd_HH-mm-ss");
+    const backupName = `Systema Backup ${timestamp}`;
+
+    // Locate the original spreadsheet in Google Drive.
+    const sourceFile = DriveApp.getFileById(ss.getId());
+    const parents = sourceFile.getParents();
+
+    // Create the backup alongside the original.
+    const backupFile = parents.hasNext()
+      ? sourceFile.makeCopy(backupName, parents.next())
+      : sourceFile.makeCopy(backupName);
+
+    // Record the successful backup.
+    const logRow = backupsSheet.getLastRow() + 1;
+    const dateStr = Utilities.formatDate(now, ss.getSpreadsheetTimeZone(), 'dd/MM/yyyy');
+    const timeStr = Utilities.formatDate(now, ss.getSpreadsheetTimeZone(), 'HH:mm:ss');
+
+    backupsSheet.getRange(logRow, 1, 1, 4).setValues([[
+      dateStr,
+      timeStr,
+      backupFile.getName(),
+      'Created'
+    ]]);
+
+    backupsSheet.getRange(logRow, 1).setNumberFormat('dd/MM/yyyy');
+    backupsSheet.getRange(logRow, 2).setNumberFormat('HH:mm:ss');
+
+    ss.toast(
+      'Backup created successfully.',
+      'Systema Backup',
+      5
+    );
+
+  } catch (error) {
+
+    try {
+      logSystemError_('Backup system', error);
+    } catch (loggingError) {
+      ss.toast(
+        `Backup failed. Error logging also failed: ${loggingError.message}`,
+        'Systema',
+        8
+      );
+    }
+
+    throw error;
+
+  } finally {
+    lock.releaseLock();
+  }
+}
