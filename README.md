@@ -9,7 +9,7 @@ Life Organizer for short term and long-term projects
 
 ## 1. Vision
 
-Build an intelligent personal operating system that understands goals, organises projects, schedules work, tracks development and adapts to changing circumstances.
+Build an intelligent personal and commercial operating system that understands goals, organises projects, schedules work, tracks development and adapts to changing circumstances.
 
 The user interacts through a conversational AI assistant (JARVIS-style). Systema handles planning, scheduling, execution, synchronisation and progress tracking.
 
